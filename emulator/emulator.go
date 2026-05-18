@@ -16,11 +16,28 @@ import (
 	"github.com/google/uuid"
 )
 
+// oscParseState is a minimal parser state used by sanitizeOSCC1 to track
+// whether the byte stream is currently inside an OSC string sequence.
+type oscParseState uint8
+
+const (
+	oscGround   oscParseState = iota // normal ground state
+	oscEsc                           // just saw 0x1B
+	oscInString                      // inside an OSC (or DCS/SOS/APC/PM) string
+	oscInStrEsc                      // saw 0x1B inside a string (potential 7-bit ST)
+)
+
 // Emulator is a headless terminal emulator that maintains internal state
 // and renders to a framebuffer instead of directly to screen
 type Emulator struct {
 	mu sync.RWMutex
 	id string
+
+	// oscState tracks whether we are inside an OSC/DCS/SOS/APC/PM string so
+	// that sanitizeOSCC1 can replace C1-range bytes (0x80–0x9F) that appear
+	// as UTF-8 continuation bytes and would otherwise be misinterpreted as C1
+	// control codes (e.g. 0x9C as STRING TERMINATOR) by the x/ansi parser.
+	oscState oscParseState
 
 	// Terminal emulator (using charm's x/vt)
 	vt *vt.Emulator
@@ -431,6 +448,76 @@ func (e *Emulator) Close() error {
 	return e.vt.Close()
 }
 
+// FeedBytes feeds raw bytes directly into the VT emulator (bypassing PTY).
+// Useful for one-shot log replay without starting a process.
+func (e *Emulator) FeedBytes(data []byte) {
+	clean := e.sanitizeOSCC1(data)
+	e.mu.Lock()
+	e.vt.Write(clean)
+	e.damaged = true
+	e.mu.Unlock()
+}
+
+// sanitizeOSCC1 replaces C1 control bytes (0x80–0x9F) inside OSC/DCS/SOS/APC/PM
+// string sequences with 0x3F ('?'). This prevents the x/ansi parser from
+// treating a UTF-8 continuation byte such as 0x9C in ✳ (U+2733) as a C1
+// STRING TERMINATOR, which would prematurely dispatch the OSC and leak the
+// remainder of the title string as visible cell text.
+func (e *Emulator) sanitizeOSCC1(in []byte) []byte {
+	hasHigh := false
+	for _, b := range in {
+		if b >= 0x80 {
+			hasHigh = true
+			break
+		}
+	}
+	if !hasHigh && e.oscState == oscGround {
+		return in
+	}
+
+	out := make([]byte, 0, len(in))
+	for _, b := range in {
+		switch e.oscState {
+		case oscGround:
+			if b == 0x1B {
+				e.oscState = oscEsc
+			}
+			out = append(out, b)
+
+		case oscEsc:
+			if b == ']' || b == 'P' || b == 'X' || b == '^' || b == '_' {
+				e.oscState = oscInString
+			} else {
+				e.oscState = oscGround
+			}
+			out = append(out, b)
+
+		case oscInString:
+			switch {
+			case b == 0x07:
+				e.oscState = oscGround
+				out = append(out, b)
+			case b == 0x1B:
+				e.oscState = oscInStrEsc
+				out = append(out, b)
+			case b >= 0x80 && b <= 0x9F:
+				out = append(out, '?')
+			default:
+				out = append(out, b)
+			}
+
+		case oscInStrEsc:
+			if b == '\\' {
+				e.oscState = oscGround
+			} else {
+				e.oscState = oscInString
+			}
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
 // vtResponseLoop reads terminal responses from the vt emulator's internal pipe
 // (e.g. device-attribute replies to CSI c) and forwards them back to the child
 // process. Without this goroutine the synchronous io.Pipe inside the vt emulator
@@ -480,8 +567,9 @@ func (e *Emulator) ptyReadLoop() {
 		}
 
 		if n > 0 {
+			clean := e.sanitizeOSCC1(buf[:n])
 			e.mu.Lock()
-			e.vt.Write(buf[:n])
+			e.vt.Write(clean)
 			e.damaged = true
 			e.mu.Unlock()
 		}
