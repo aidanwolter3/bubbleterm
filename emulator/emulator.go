@@ -53,7 +53,7 @@ type Emulator struct {
 	// Process tracking
 	cmd           *exec.Cmd
 	processExited bool
-	onExit        func(string) // Callback when process exits, receives emulator ID
+	onExit        func(string, error) // called when process exits: id, exit error
 
 	// Framerate control
 	frameRate time.Duration
@@ -264,11 +264,12 @@ func (e *Emulator) Cursor() (Pos, bool) {
 	return Pos{X: pos.X, Y: pos.Y}, true
 }
 
-// SetOnExit sets a callback function that will be called when the process exits
-func (e *Emulator) SetOnExit(callback func(string)) {
+// SetOnExit registers a callback invoked when the process exits.
+// The callback receives the emulator ID and the process exit error (nil on clean exit).
+func (e *Emulator) SetOnExit(cb func(id string, exitErr error)) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.onExit = callback
+	e.onExit = cb
 }
 
 // IsProcessExited returns true if the process has exited
@@ -338,14 +339,21 @@ func (e *Emulator) StartCommand(cmd *exec.Cmd) error {
 	return nil
 }
 
-// monitorProcess waits for the process to exit and calls the exit callback
+// monitorProcess waits for the process to exit and calls the exit callback.
 func (e *Emulator) monitorProcess() {
 	if e.cmd == nil {
 		return
 	}
 
-	// Wait for the process to exit
-	_ = e.cmd.Wait()
+	exitErr := e.cmd.Wait()
+
+	// Close tty before acquiring the mutex to unblock ptyReadLoop promptly on
+	// macOS. The master PTY side does not return EIO until all slave file
+	// descriptors are closed; without this, ptyReadLoop blocks indefinitely
+	// even after the process has exited.
+	if e.tty != nil {
+		e.tty.Close()
+	}
 
 	e.mu.Lock()
 	e.processExited = true
@@ -353,9 +361,8 @@ func (e *Emulator) monitorProcess() {
 	id := e.id
 	e.mu.Unlock()
 
-	// Call the exit callback if set
 	if onExit != nil {
-		onExit(id)
+		onExit(id, exitErr)
 	}
 }
 

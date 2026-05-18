@@ -228,7 +228,7 @@ func TestEmulatorOnExitCallback(t *testing.T) {
 	defer e.Close()
 
 	exitCalled := make(chan string, 1)
-	e.SetOnExit(func(id string) {
+	e.SetOnExit(func(id string, _ error) {
 		exitCalled <- id
 	})
 

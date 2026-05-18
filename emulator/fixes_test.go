@@ -18,9 +18,9 @@ func TestVTResponseLoopNoDeadlock(t *testing.T) {
 	}
 	defer e.Close()
 
-	done := make(chan struct{}, 1)
-	e.SetOnExit(func(_ string) {
-		done <- struct{}{}
+	done := make(chan error, 1)
+	e.SetOnExit(func(_ string, exitErr error) {
+		done <- exitErr
 	})
 
 	cmd := exec.Command("/bin/bash", "-c", `printf '\033[c'; sleep 0.05`)
@@ -34,6 +34,7 @@ func TestVTResponseLoopNoDeadlock(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("vtResponseLoop deadlock: process did not exit within 2s")
 	}
+
 }
 
 // TestSanitizeOSCC1 verifies that C1-range bytes inside OSC strings are
