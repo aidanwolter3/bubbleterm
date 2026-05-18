@@ -80,8 +80,8 @@ func New(cols, rows int) (*Emulator, error) {
 		return nil, err
 	}
 
-	// Start the PTY read loop
 	go e.ptyReadLoop()
+	go e.vtResponseLoop()
 
 	return e, nil
 }
@@ -104,8 +104,8 @@ func NewFromPipes(cols, rows int, r io.Reader, w io.WriteCloser) (*Emulator, err
 		damaged:   true,
 	}
 
-	// Start the read loop using the provided reader
 	go e.ptyReadLoop()
+	go e.vtResponseLoop()
 
 	return e, nil
 }
@@ -429,6 +429,32 @@ func (e *Emulator) Close() error {
 	}
 
 	return e.vt.Close()
+}
+
+// vtResponseLoop reads terminal responses from the vt emulator's internal pipe
+// (e.g. device-attribute replies to CSI c) and forwards them back to the child
+// process. Without this goroutine the synchronous io.Pipe inside the vt emulator
+// blocks the very first response write, which stalls ptyReadLoop while it holds
+// e.mu and deadlocks the entire emulator.
+func (e *Emulator) vtResponseLoop() {
+	buf := make([]byte, 4096)
+	for {
+		n, err := e.vt.Read(buf)
+		if err != nil {
+			return
+		}
+		if n > 0 {
+			if e.isPipe {
+				if e.writer != nil {
+					e.writer.Write(buf[:n]) //nolint:errcheck
+				}
+			} else {
+				if e.pty != nil {
+					e.pty.Write(buf[:n]) //nolint:errcheck
+				}
+			}
+		}
+	}
 }
 
 // ptyReadLoop reads from PTY/pipe and writes to the vt emulator
