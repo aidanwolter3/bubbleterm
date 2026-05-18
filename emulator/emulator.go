@@ -55,6 +55,12 @@ type Emulator struct {
 	processExited bool
 	onExit        func(string, error) // called when process exits: id, exit error
 
+	// onRawOutput is called with raw PTY bytes (before sanitization) on each read.
+	onRawOutput func([]byte)
+
+	// damageCh is signaled after each vt.Write so callers can poll GetScreen.
+	damageCh chan struct{}
+
 	// Framerate control
 	frameRate time.Duration
 	stopChan  chan struct{}
@@ -80,6 +86,7 @@ func New(cols, rows int) (*Emulator, error) {
 		id:        uuid.New().String(),
 		frameRate: time.Second / 30, // Default 30 FPS
 		stopChan:  make(chan struct{}),
+		damageCh:  make(chan struct{}, 1),
 		width:     cols,
 		height:    rows,
 		damaged:   true, // Initial render needed
@@ -113,6 +120,7 @@ func NewFromPipes(cols, rows int, r io.Reader, w io.WriteCloser) (*Emulator, err
 		id:        uuid.New().String(),
 		frameRate: time.Second / 30,
 		stopChan:  make(chan struct{}),
+		damageCh:  make(chan struct{}, 1),
 		reader:    r,
 		writer:    w,
 		isPipe:    true,
@@ -271,6 +279,20 @@ func (e *Emulator) SetOnExit(cb func(id string, exitErr error)) {
 	defer e.mu.Unlock()
 	e.onExit = cb
 }
+
+// SetOnRawOutput registers a callback invoked with raw PTY bytes before
+// they are processed by the VT emulator. Use this to capture output logs.
+func (e *Emulator) SetOnRawOutput(cb func([]byte)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.onRawOutput = cb
+}
+
+// DamageChan returns a channel that receives a value after each chunk of PTY
+// output is processed. The channel is buffered (capacity 1); a blocked sender
+// is skipped so callers never slow down the emulator. Poll GetScreen() after
+// receiving from this channel.
+func (e *Emulator) DamageChan() <-chan struct{} { return e.damageCh }
 
 // IsProcessExited returns true if the process has exited
 func (e *Emulator) IsProcessExited() bool {
@@ -574,11 +596,24 @@ func (e *Emulator) ptyReadLoop() {
 		}
 
 		if n > 0 {
+			e.mu.RLock()
+			cb := e.onRawOutput
+			e.mu.RUnlock()
+			if cb != nil {
+				cb(buf[:n])
+			}
+
 			clean := e.sanitizeOSCC1(buf[:n])
 			e.mu.Lock()
 			e.vt.Write(clean)
 			e.damaged = true
 			e.mu.Unlock()
+
+			// Signal damage so callers can poll GetScreen.
+			select {
+			case e.damageCh <- struct{}{}:
+			default:
+			}
 		}
 	}
 }
